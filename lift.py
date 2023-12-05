@@ -2,7 +2,7 @@ from collections import OrderedDict
 import numpy as np
 
 from robosuite.utils.transform_utils import convert_quat
-from robosuite.utils.mjcf_utils import CustomMaterial
+from robosuite.utils.mjcf_utils import CustomMaterial, array_to_string
 
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 
@@ -10,7 +10,7 @@ from robosuite.models.arenas import TableArena
 from robosuite.models.objects import BoxObject
 from robosuite.models.objects import BallObject
 from robosuite.models.tasks import ManipulationTask
-from robosuite.utils.placement_samplers import UniformRandomSampler
+from robosuite.utils.placement_samplers import UniformRandomSampler, ObjectPositionSampler
 from robosuite.utils.observables import Observable, sensor
 
 
@@ -130,10 +130,10 @@ class Lift(SingleArmEnv):
         controller_configs=None,
         gripper_types="default",
         initialization_noise="default",
-        table_full_size=(0.8, 0.8, 0.05),
+        table_full_size=(1.375, 1.5, 0.03),
         table_friction=(1, 5e-3, 1e-4),
         use_camera_obs=True,
-        use_object_obs=True,
+        use_object_obs=False,
         reward_scale=1.0,
         reward_shaping=False,
         placement_initializer= None,
@@ -144,12 +144,12 @@ class Lift(SingleArmEnv):
         render_visual_mesh=True,
         render_gpu_device_id=-1,
         control_freq=20,
-        horizon=1000,
+        horizon=200,
         ignore_done=False,
         hard_reset=True,
         camera_names="agentview",
-        camera_heights=256,
-        camera_widths=256,
+        camera_heights=100,
+        camera_widths=275,
         camera_depths=False,
     ):
         # settings for table top
@@ -240,39 +240,137 @@ class Lift(SingleArmEnv):
             table_offset=self.table_offset,
         )
 
+
         # Arena always gets set to zero origin
         mujoco_arena.set_origin([0, 0, 0])
 
         # initialize objects of interest
 
+
         self.sphere = BallObject (
             name = "sphere",
-            size = [0.5], 
-            rgba = [1,0,0,1]
+            size = [0.03], 
+            rgba = [1,0,0,1], 
+            density=None, 
+            friction=None, 
+            solref=None, 
+            solimp=None, 
+            material=None, 
+            joints='default', 
+            obj_type='all', 
+            duplicate_collision_geoms=True 
         )
+        
 
         # Create placement initializer
-        if self.placement_initializer is not None:
-            self.placement_initializer.reset()
-            self.placement_initializer.add_objects(self.sphere)
-        else:
+        if self.placement_initializer is None:
+        
             self.placement_initializer = UniformRandomSampler(
                 name="ObjectSampler",
                 mujoco_objects=self.sphere,
                 x_range=[-0.03, 0.03],
                 y_range=[-0.03, 0.03],
-                rotation=None,
-                ensure_object_boundary_in_range=True,
+                ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
-                reference_pos=[2.5,1.8,1.6],
-                z_offset=0.01,
-            )
+                reference_pos=(0,0,2),
+                z_offset=0.01
+        )
+        
+
+
+        """UniformRandomSampler(
+        name="ObjectSampler",
+        mujoco_objects=self.sphere,
+        x_range=[-0.12, 0.12],
+        y_range=[-0.12, 0.12],
+        ensure_object_boundary_in_range=False,
+        ensure_valid_placement=False,
+        reference_pos=mujoco_arena.table_top_abs,
+        z_offset=0.01,
+)"""
+       
+
+
+        
+        
+        
+        
 
         # task includes arena, robot, and objects of interest
         self.model = ManipulationTask(
             mujoco_arena=mujoco_arena,
             mujoco_robots=[robot.robot_model for robot in self.robots], 
             mujoco_objects=self.sphere
-    )
+        )
 
+    def _setup_references(self):
+        super()._setup_references()
+
+        self.sphere_body_id = self.sim.model.body_name2id(self.sphere.root_body)
     
+    def _setup_observables(self):
+        observables = super()._setup_observables()
+        if self.use_object_obs:
+            # Get robot prefix and define observables modality
+            pf = self.robots[0].robot_model.naming_prefix
+            modality = "object"
+
+            @sensor(modality=modality)
+            def sphere_pos(obs_cache):
+                return np.array(self.sim.data.body_xpos[self.sphere_body_id])
+
+            @sensor(modality=modality)
+            def sphere_quat(obs_cache):
+                return convert_quat(np.array(self.sim.data.body_xquat[self.sphere_body_id]), to="xyzw")
+            
+            @sensor(modality=modality)
+            def gripper_to_sphere_pos(obs_cache):
+                return (
+                    obs_cache[f"{pf}eef_pos"] - obs_cache["sphere_pos"]
+                    if f"{pf}eef_pos" in obs_cache and "sphere_pos" in obs_cache
+                    else np.zeros(3)
+                )
+            
+            sensors = [sphere_pos, sphere_quat, gripper_to_sphere_pos]
+            names = [s.__name__ for s in sensors]
+
+            # Create observables
+            for name, s in zip(names, sensors):
+                observables[name] = Observable(
+                    name=name,
+                    sensor=s,
+                    sampling_rate=self.control_freq,
+                )
+
+        return observables
+    
+    def _reset_internal(self):
+        """
+        Resets simulation internal configurations.
+        """
+        super()._reset_internal()
+
+        # Reset all object positions using initializer sampler if we're not directly loading from an xml
+        if not self.deterministic_reset:
+
+            # Sample from the placement initializer for all objects
+            object_placements = self.placement_initializer.sample()
+
+            # Loop through all objects and reset their positions
+            for obj_pos, obj_quat, obj in object_placements.values():
+                self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+    def visualize(self, vis_settings):
+        """
+        In addition to super call, visualize gripper site proportional to the distance to the cube.
+
+        Args:
+            vis_settings (dict): Visualization keywords mapped to T/F, determining whether that specific
+                component should be visualized. Should have "grippers" keyword as well as any other relevant
+                options specified.
+        """
+        # Run superclass method first
+        super().visualize(vis_settings=vis_settings)
+
+        # Color the gripper visualization site according to its distance to the cube
+        if vis_settings["grippers"]:
+            self._visualize_gripper_to_target(gripper=self.robots[0].gripper, target=self.sphere)
